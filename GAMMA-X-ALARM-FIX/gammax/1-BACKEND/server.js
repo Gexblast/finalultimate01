@@ -1618,15 +1618,6 @@ app.get('/health', async (req, res) => {
   catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
-// Zero-cost keep-alive target for an external cron pinger (cron-job.org /
-// UptimeRobot etc). Does NOT touch Angel One — just proves the process is
-// awake. Point an external monitor at this every 5 min during market hours
-// so Render's free-tier dyno never spins down and the push schedulers
-// (ultimateAlertTick / rsiEmaAlertTick below) keep running even when the
-// phone app is fully closed. /health calls ensureSession() so it's heavier —
-// use /ping for frequent pinging.
-app.get('/ping', (req, res) => res.json({ ok: true, t: Date.now(), subs: pushSubscriptions.size }));
-
 // Safe diagnostics: values kabhi nahi dikhata, sirf length/format check karta hai
 app.get('/debug', (req, res) => {
   let totpOk = false, totpErr = null, code = null;
@@ -1861,12 +1852,6 @@ app.get('/option-candles', async (req, res) => {
 // value/LTP/Greeks from the existing analyze() machinery, plus a unified
 // entry-quality score blending the whole signal stack.
 const rsiEmaLastPush = new Map();
-// Below this quality score, the setup is either low-conviction or the entry
-// trigger is firing on the OPPOSITE side of the Direction Lean (conflicting
-// signals — e.g. 15m lean PUT at quality 23 while 5m trigger fires CALL).
-// Both the push alerts AND the on-screen strikes are gated on this so a
-// conflicting/weak setup never looks like a clean, actionable trade.
-const MIN_ALERT_QUALITY = 40;
 // Core signal computation — used by BOTH the route (when app is open) AND the
 // independent background scheduler below (so alerts fire even if the PWA is
 // closed, same pattern as the Ultimate Alert scheduler).
@@ -1890,16 +1875,43 @@ function computeDirectionLean(data) {
   const amplifying = (de.dealerHedgePressureScore || 0) > 25;
 
   const of = data.orderFlow || null;
+  let ofScore = 0;
   if (of) {
-    if (of.state === 'STRONG_BULL') { score += 25; reasons.push('Order flow: ' + of.note); }
-    else if (of.state === 'STRONG_BEAR') { score -= 25; reasons.push('Order flow: ' + of.note); }
-    else if (of.state === 'BULL_WARNING') { score -= 15; reasons.push('⚠ Order flow: ' + of.note); }
-    else if (of.state === 'BEAR_WARNING') { score += 15; reasons.push('⚠ Order flow: ' + of.note); }
+    if (of.state === 'STRONG_BULL') { ofScore = 25; reasons.push('Order flow: ' + of.note); }
+    else if (of.state === 'STRONG_BEAR') { ofScore = -25; reasons.push('Order flow: ' + of.note); }
+    else if (of.state === 'BULL_WARNING') { ofScore = -15; reasons.push('⚠ Order flow: ' + of.note); }
+    else if (of.state === 'BEAR_WARNING') { ofScore = 15; reasons.push('⚠ Order flow: ' + of.note); }
   }
+  score += ofScore;
 
+  // Today's momentum — scaled by MAGNITUDE, not a flat snap. A real intraday
+  // move can now properly outweigh a stale multi-day read instead of just
+  // cancelling it out into a weak, stuck-in-the-middle score (this was the
+  // bug: a real PUT day showing as "weak CALL" because a fixed +20 from the
+  // multi-day trend was silently absorbing the intraday PUT signals).
+  const mom = data.momentum || 0;
+  let momScore = 0;
+  if (Math.abs(mom) > 0.05) {
+    momScore = Math.max(-30, Math.min(30, mom * 20));
+    reasons.push('Spot momentum ' + (mom > 0 ? 'up' : 'down') + ' ' + Math.abs(mom).toFixed(2) + '%');
+  }
+  score += momScore;
+
+  // Multi-day trend — a SLOW, structural read. Full weight (±20) only when
+  // today agrees with it. When today's order flow + momentum clearly oppose
+  // the multi-day trend (a reversal day, exactly like a PUT day inside an
+  // uptrend), its weight is cut to ±6 so it can no longer silently cancel a
+  // real intraday move into a stuck, falsely-weak score.
   const tr = data.trendRegime || null;
-  if (tr && tr.regime === 'UPTREND') { score += 20; reasons.push('Multi-day: ' + tr.note); }
-  if (tr && tr.regime === 'DOWNTREND') { score -= 20; reasons.push('Multi-day: ' + tr.note); }
+  if (tr && (tr.regime === 'UPTREND' || tr.regime === 'DOWNTREND')) {
+    const trendDir = tr.regime === 'UPTREND' ? 1 : -1;
+    const todaySum = ofScore + momScore;
+    const todayDir = todaySum === 0 ? 0 : (todaySum > 0 ? 1 : -1);
+    const opposing = todayDir !== 0 && todayDir !== trendDir;
+    const weight = opposing ? 6 : 20;
+    score += trendDir * weight;
+    reasons.push('Multi-day: ' + tr.note + (opposing ? ' — but TODAY is reversing against this, so its weight is reduced' : ''));
+  }
 
   const vx = data.vixRegime || null;
   if (vx && vx.regime && vx.regime.startsWith('SPIKE')) reasons.push('VIX +' + vx.dayChangePct + '% — big-move day conditions');
@@ -1909,9 +1921,6 @@ function computeDirectionLean(data) {
     if (ff.fiiNetCr < -2000) { score -= 12; reasons.push('FII net ₹' + ff.fiiNetCr + ' Cr — selling pressure'); }
     else if (ff.fiiNetCr > 2000) { score += 12; reasons.push('FII net +₹' + ff.fiiNetCr + ' Cr — buying'); }
   }
-
-  const mom = data.momentum || 0;
-  if (Math.abs(mom) > 0.08) { score += (mom > 0 ? 10 : -10); reasons.push('Spot momentum ' + (mom > 0 ? 'up' : 'down') + ' ' + Math.abs(mom).toFixed(2) + '%'); }
 
   score = Math.max(-100, Math.min(100, Math.round(score)));
   // Tie-break: default to CE so `side` is NEVER null — a real dead-even market
@@ -1983,7 +1992,6 @@ async function computeRsiEmaSignal(idx, tf) {
   return {
     success: true, index: idx, tf, side, spot: data.spot, atm, barsSince, score, reasons,
     entryTrigger, isEarlyOnly, triggerAgrees, state: displayState,
-    tradable: score >= MIN_ALERT_QUALITY,
     lean: { side: lean.side, score: lean.score, confidence: lean.confidence },
     recent: signals.slice(-5).map(s => ({ time: s.time, side: s.side })),
     strikes,
@@ -2013,7 +2021,7 @@ app.get('/rsi-ema-signal', async (req, res) => {
     const out = await computeRsiEmaSignal(idx, tf);
     // opportunistic push if this request surfaces a fresh, un-alerted signal
     // (belt-and-suspenders alongside the independent scheduler below)
-    if (out._pushKey && !out.stale && out.score >= MIN_ALERT_QUALITY && rsiEmaLastPush.get(out._pushKey) !== out._pushTime) {
+    if (out._pushKey && !out.stale && rsiEmaLastPush.get(out._pushKey) !== out._pushTime) {
       rsiEmaLastPush.set(out._pushKey, out._pushTime);
       const isEarly = out._isEarly;
       broadcastPush({
@@ -2213,7 +2221,6 @@ async function rsiEmaAlertTick() {
       try {
         const out = await computeRsiEmaSignal(idx, tf);
         if (!out._pushKey || out.stale) continue;
-        if (out.score < MIN_ALERT_QUALITY) continue; // low-conviction or conflicting trigger — skip, don't alert
         if (rsiEmaLastPush.get(out._pushKey) === out._pushTime) continue; // already alerted this exact bar
         rsiEmaLastPush.set(out._pushKey, out._pushTime);
         const isEarly = out._isEarly;
